@@ -1,71 +1,122 @@
+// deploy.js
 const { ethers } = require('ethers');
-const fs = require('fs');
+const fs = require('fs').promises;
 const path = require('path');
 require('dotenv').config();
 
 async function main() {
-	// Load the chain configuration from the JSON file
-	const chains = JSON.parse(
-		fs.readFileSync(path.resolve(__dirname, '../deploy-config/chains.json'))
-	);
+    try {
+        // Validate essential environment variables
+        if (!process.env.PRIVATE_KEY) {
+            throw new Error("PRIVATE_KEY is not set in the environment variables.");
+        }
 
-	// Get the Celo Testnet configuration
-	const celoChain = chains.chains.find((chain) => chain.description.includes('Celo Testnet'));
+        // Load the chain configuration from the JSON file
+        const chainsPath = path.resolve(__dirname, '../deploy-config/chains.json');
+        const chainsData = await fs.readFile(chainsPath, 'utf8');
+        const chains = JSON.parse(chainsData);
 
-	// Set up the provider and wallet
-	const provider = new ethers.JsonRpcProvider(celoChain.rpc);
-	const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+        // Get the Celo Testnet configuration
+        const celoChain = chains.chains.find(chain => chain.description.includes('Celo Testnet'));
+        if (!celoChain) {
+            throw new Error("Celo Testnet configuration not found in chains.json.");
+        }
 
-	// Load the ABI and bytecode of the MessageReceiver contract
-	const messageReceiverJson = JSON.parse(
-		fs.readFileSync(
-			path.resolve(__dirname, '../out/MessageReceiver.sol/MessageReceiver.json'),
-			'utf8'
-		)
-	);
+        // Set up the provider and wallet
+        const provider = new ethers.JsonRpcProvider(celoChain.rpc);
+        const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
-	const abi = messageReceiverJson.abi;
-	const bytecode = messageReceiverJson.bytecode;
+        // Load the ABI and bytecode of the MessageReceiver contract
+        const messageReceiverPath = path.resolve(__dirname, '../out/MessageReceiver.sol/MessageReceiver.json');
+        const messageReceiverData = await fs.readFile(messageReceiverPath, 'utf8');
+        const messageReceiverJson = JSON.parse(messageReceiverData);
 
-	// Create a ContractFactory for MessageReceiver
-	const MessageReceiver = new ethers.ContractFactory(abi, bytecode, wallet);
+        const { abi, bytecode } = messageReceiverJson;
 
-	// Deploy the contract using the Wormhole Relayer address for Celo Testnet
-	const receiverContract = await MessageReceiver.deploy(celoChain.wormholeRelayer);
-	await receiverContract.waitForDeployment();
+        // Create a ContractFactory for MessageReceiver
+        const MessageReceiverFactory = new ethers.ContractFactory(abi, bytecode, wallet);
 
-	console.log('MessageReceiver deployed to:', receiverContract.target); // `target` is the contract address in ethers.js v6
+        console.log("Deploying MessageReceiver contract...");
+        // Deploy the contract using the Wormhole Relayer address for Celo Testnet
+        const receiverContract = await MessageReceiverFactory.deploy(celoChain.wormholeRelayer);
+        await receiverContract.deployed();
 
-	// Update the deployedContracts.json file
-	const deployedContractsPath = path.resolve(__dirname, '../deploy-config/deployedContracts.json');
-	const deployedContracts = JSON.parse(fs.readFileSync(deployedContractsPath, 'utf8'));
+        console.log('MessageReceiver deployed to:', receiverContract.address);
 
-	// Retrieve the address of the MessageSender from the deployedContracts.json file
-	const avalancheSenderAddress = deployedContracts.avalanche.MessageSender;
+        // Update the deployedContracts.json file
+        const deployedContractsPath = path.resolve(__dirname, '../deploy-config/deployedContracts.json');
+        let deployedContracts = {};
+        try {
+            const deployedContractsData = await fs.readFile(deployedContractsPath, 'utf8');
+            deployedContracts = JSON.parse(deployedContractsData);
+        } catch (err) {
+            if (err.code === 'ENOENT') {
+                // File does not exist, initialize an empty object
+                deployedContracts = {};
+            } else {
+                throw err;
+            }
+        }
 
-	// Define the source chain ID for Avalanche Fuji
-	const sourceChainId = 6;
+        // Retrieve the address of the MessageSender from the deployedContracts.json file
+        const avalancheContracts = deployedContracts.avalanche;
+        if (!avalancheContracts || !avalancheContracts.MessageSender) {
+            throw new Error("Avalanche MessageSender address not found in deployedContracts.json.");
+        }
+        const avalancheSenderAddress = avalancheContracts.MessageSender;
 
-	// Call setRegisteredSender on the MessageReceiver contract
-	const tx = await receiverContract.setRegisteredSender(
-		sourceChainId,
-		ethers.zeroPadValue(avalancheSenderAddress, 32)
-	);
-	await tx.wait(); // Wait for the transaction to be confirmed
+        // Define the source chain ID for Avalanche Fuji
+        const sourceChainId = 6;
 
-	console.log(
-		`Registered MessageSender (${avalancheSenderAddress}) for Avalanche chain (${sourceChainId})`
-	);
+        console.log("Registering Avalanche MessageSender address...");
+        // Call setRegisteredSender on the MessageReceiver contract
+        const tx = await receiverContract.setRegisteredSender(
+            sourceChainId,
+            ethers.zeroPadValue(avalancheSenderAddress, 32)
+        );
+        await tx.wait(); // Wait for the transaction to be confirmed
 
-	deployedContracts.celo = {
-		MessageReceiver: receiverContract.target,
-		deployedAt: new Date().toISOString(),
-	};
+        console.log(`Registered MessageSender (${avalancheSenderAddress}) for Avalanche chain (${sourceChainId})`);
 
-	fs.writeFileSync(deployedContractsPath, JSON.stringify(deployedContracts, null, 2));
+        // Update the deployedContracts.json with the new Celo deployment
+        deployedContracts.celo = {
+            MessageReceiver: receiverContract.address,
+            deployedAt: new Date().toISOString(),
+        };
+
+        await fs.writeFile(deployedContractsPath, JSON.stringify(deployedContracts, null, 2));
+        console.log("Deployment details updated in deployedContracts.json.");
+
+        // Optional: Set up event listeners for game transactions
+        // This can be extended based on specific requirements
+        setupEventListeners(receiverContract);
+
+    } catch (error) {
+        console.error("Error during deployment:", error);
+        process.exit(1);
+    }
 }
 
-main().catch((error) => {
-	console.error(error);
-	process.exit(1);
-});
+function setupEventListeners(contract) {
+    // Listen for GameTransactionProcessed events
+    contract.on("GameTransactionProcessed", (player, action, value, event) => {
+        console.log(`Game Transaction - Player: ${player}, Action: ${action}, Value: ${value}`);
+        // Additional logic can be added here, such as updating a database or triggering other processes
+    });
+
+    // Listen for MessageReceived events
+    contract.on("MessageReceived", (message, event) => {
+        console.log(`Message Received: ${message}`);
+        // Additional processing can be done here
+    });
+
+    // Listen for SourceChainLogged events
+    contract.on("SourceChainLogged", (sourceChain, event) => {
+        console.log(`Source Chain Logged: ${sourceChain}`);
+        // Additional processing can be done here
+    });
+
+    console.log("Event listeners set up for MessageReceiver contract.");
+}
+
+main();
